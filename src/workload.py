@@ -1,5 +1,7 @@
 import os
 import random
+import csv
+from typing import Dict, List, Any
 
 def ensure_datasets():
     """
@@ -37,24 +39,61 @@ def ensure_datasets():
             f.write(dummy_content)
     return file_path
 
-def get_google_cluster_resources(num_machines):
+def _load_cluster_profile_csv(csv_path: str) -> Dict[int, Dict[str, float]]:
+    """
+    Load deterministic node profiles from a CSV file.
+    Expected columns: id, IPT, RAM, static_power, power_alpha, failure_rate
+    """
+    profiles: Dict[int, Dict[str, float]] = {}
+    if not os.path.exists(csv_path):
+        return profiles
+
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                node_id = int(row["id"])
+            except (KeyError, ValueError):
+                continue
+            profiles[node_id] = {
+                "IPT": float(row.get("IPT", 1.0)),
+                "RAM": float(row.get("RAM", 8000)),
+                "static_power": float(row.get("static_power", 20)),
+                "power_alpha": float(row.get("power_alpha", 0.05)),
+                "failure_rate": float(row.get("failure_rate", 0.001)),
+            }
+    return profiles
+
+
+def get_google_cluster_resources(num_machines: int) -> Dict[int, Dict[str, Any]]:
     """
     Returns a dictionary of node profiles {machine_id: {attributes}}
     Simulates Google Cluster Traces with 3 classes of nodes:
     - High Perf (Class A): High IPT, High Power, Med Reliability
     - Balanced  (Class B): Med IPT, Med Power, High Reliability
     - Low Power (Class C): Low IPT, Low Power, Low Reliability (Edge Devices)
+    If data/google_cluster_profiles.csv exists, it is used to provide
+    deterministic, reproducible node profiles.
     """
-    profiles = {}
-    
+    csv_profiles = _load_cluster_profile_csv("data/google_cluster_profiles.csv")
+    if csv_profiles:
+        # Trim/pad to requested number of machines deterministically
+        ordered_ids = sorted(csv_profiles.keys())
+        selected_ids = ordered_ids[:num_machines]
+        profiles = {i: csv_profiles[node_id] for i, node_id in enumerate(selected_ids)}
+        return profiles
+
+    profiles: Dict[int, Dict[str, Any]] = {}
+    rng = random.Random(42)  # reproducible fallback
+
     # Ratios: 20% High, 50% Med, 30% Low
     for i in range(num_machines):
-        node_type = random.choices(['A', 'B', 'C'], weights=[0.2, 0.5, 0.3])[0]
+        node_type = rng.choices(['A', 'B', 'C'], weights=[0.2, 0.5, 0.3])[0]
         
         if node_type == 'A':
             # Fast but Power Hungry
             profiles[i] = {
-                'IPT': random.uniform(1.8, 2.5),  # Instructions Per Time (Speedup)
+                'IPT': rng.uniform(1.8, 2.5),  # Instructions Per Time (Speedup)
                 'RAM': 32000,
                 'static_power': 100,
                 'power_alpha': 0.15,
@@ -63,7 +102,7 @@ def get_google_cluster_resources(num_machines):
         elif node_type == 'B':
             # Balanced
             profiles[i] = {
-                'IPT': random.uniform(1.0, 1.5),
+                'IPT': rng.uniform(1.0, 1.5),
                 'RAM': 16000,
                 'static_power': 50,
                 'power_alpha': 0.08,
@@ -72,7 +111,7 @@ def get_google_cluster_resources(num_machines):
         else:
             # IoT / Edge Device (Slow, Low Power, Unreliable)
             profiles[i] = {
-                'IPT': random.uniform(0.3, 0.8),
+                'IPT': rng.uniform(0.3, 0.8),
                 'RAM': 4000,
                 'static_power': 10,
                 'power_alpha': 0.02,
