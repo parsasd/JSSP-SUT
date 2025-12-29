@@ -1,66 +1,44 @@
+"""
+Minimal smoke test for the updated JSSP pipeline.
+Runs a short YAFS simulation with the default dataset and placement mapping.
+"""
 import yafs.core
-import networkx as nx
-from yafs.topology import Topology
 from yafs.selection import First_ShortestPath
 
-# Import our custom scripts
-from workload import parse_taillard
-from job_factory import JobFactory
 from placement import JSSPPlacement
 from simple_population import SimplePopulation
+from job_factory import JSSPWorkload
+from workload import parse_taillard, ensure_datasets, get_google_cluster_resources
 from yafs_patch import apply_yafs_patches
+from ga_optimizer import create_topology, OP_SPECS
 
-def create_topology():
-    G = nx.Graph()
-    # Node 0: Cloud/Controller
-    G.add_node(0, IPT=1000, RAM=32000, power_alpha=0.05, static_power=50) 
-    
-    # Nodes 1-15: Edge Machines (Matching Taillard's 15 machines)
-    for i in range(1, 16): 
-        G.add_node(i, IPT=500, RAM=8000, power_alpha=0.03, static_power=20)
-    
-    # Star topology
-    for i in range(1, 16):
-        G.add_edge(0, i, BW=100, PR=10)
-        
-    t = Topology()
-    t.G = G
-    return t
 
 def main():
     apply_yafs_patches()
-    print("--- 1. Parsing Data ---")
-    raw_jobs = parse_taillard("data/taillard_instances/ta01.txt")
+    ta_file = ensure_datasets()
+    raw_jobs = parse_taillard(ta_file)
+    node_profiles = get_google_cluster_resources(15)
 
-    print("--- 2. Building YAFS DAGs ---")
-    factory = JobFactory(raw_jobs)
-    applications = factory.create_applications()
+    # Map each operation to its first eligible node
+    module_node_map = {}
+    for op in OP_SPECS:
+        module_node_map[f"Op_{op['job_id']}_{op['op_idx']}"] = op["eligible_nodes"][0]
 
-    print("--- 3. Setup Simulator ---")
-    s = yafs.core.Sim(create_topology(), default_results_path="logs/log_test")
-    
-    # Define Policies
-    # Placement: Our custom JSSP logic
-    placement_policy = JSSPPlacement(name="JSSP_Static")
-    # Selection: Shortest Path (Standard for routing messages)
-    selection_policy = First_ShortestPath()
-    population_policy = SimplePopulation(node_id=0, name="SimplePop")
+    workload_factory = JSSPWorkload(raw_jobs, OP_SPECS)
+    release_times = {j: 0 for j in raw_jobs}
+    app = workload_factory.create_application(release_times, module_node_map)
 
-    # Deploy Applications
-    for app in applications:
-        s.deploy_app(app, placement_policy, selection_policy)
-        if population_policy.name not in s.population_policy:
-            s.population_policy[population_policy.name] = {
-                "population_policy": population_policy,
-                "apps": [],
-            }
-        s.population_policy[population_policy.name]["apps"].append(app.name)
+    topo = create_topology(node_profiles)
+    sim = yafs.core.Sim(topo, default_results_path="logs/log_test")
+    placement = JSSPPlacement(module_node_map)
+    pop_policy = SimplePopulation(node_id=0, name="SimplePop")
 
-    print("--- 4. Running Simulation ---")
-    # Run for enough time to complete all jobs (e.g., 5000 units)
-    s.run(until=5000)
-    
-    print("Done! Check 'logs/log_test.csv' for results.")
+    sim.deploy_app(app, placement, selection=First_ShortestPath())
+    sim.population_policy[pop_policy.name] = {"population_policy": pop_policy, "apps": [app.name]}
 
-if __name__ == '__main__':
+    sim.run(until=1000)
+    print("Smoke test completed.")
+
+
+if __name__ == "__main__":
     main()

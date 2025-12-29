@@ -1,34 +1,31 @@
 from yafs.placement import Placement
 from yafs.application import Application
 
+
 class JSSPPlacement(Placement):
     """
-    Maps:
-    - 'Source_Job_X' -> Node 0 (Cloud/Controller)
-    - 'Machine_X'    -> Node X+1 (Edge Nodes 1..15)
+    Placement policy that maps sources to node 0 and operation modules to nodes
+    chosen by the optimizer.
     """
+
+    def __init__(self, module_node_map, name="JSSPPlacement", logger=None):
+        super().__init__(name=name, logger=logger)
+        self.module_node_map = module_node_map
+
     def initial_allocation(self, sim, app_name):
         allocations = []
         app = sim.apps[app_name]
-        
-        # In YAFS, app.services contains the list of services per module.
-        # We iterate module names.
-        for module_name in app.services.keys():
-            
-            # 1. Check if it's a Source
+
+        for module_name, services in app.services.items():
+            # Sources live on node 0
             if module_name.startswith("Source"):
-                # Deploy sources on Node 0
                 allocations.append((module_name, 0))
-            
-            # 2. Check if it's a Machine
-            elif module_name.startswith("Machine_"):
-                # Extract ID: "Machine_5" -> 5
-                try:
-                    m_id = int(module_name.split("_")[1])
-                    # Taillard Machines 0-14 map to Topology Nodes 1-15
-                    node_id = m_id + 1
-                    sim.deploy_module(app_name, module_name, app.services[module_name], ids=[node_id])
-                except ValueError:
-                    print(f"Warning: Could not parse machine ID from {module_name}")
-        
+                continue
+
+            # All operation modules are mapped by the GA
+            target_node = self.module_node_map.get(module_name)
+            if target_node is None:
+                continue
+            sim.deploy_module(app_name, module_name, services, ids=[target_node])
+
         return allocations
