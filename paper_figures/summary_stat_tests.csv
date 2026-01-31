@@ -1,0 +1,6 @@
+metric,comparison,direction,n_mode,n_baseline,median_diff_mode_minus_baseline,mean_diff_mode_minus_baseline,cliffs_delta,p_value_perm_median
+best_makespan,RL-AOS-GA vs Static NSGA-II,lower,10,10,5.122294372294277,4.484451659451793,0.36,0.1414858514148585
+best_energy,RL-AOS-GA vs Static NSGA-II,lower,10,10,4667.938715203782,4047.885605697753,0.34,0.14428557144285573
+best_reliability,RL-AOS-GA vs Static NSGA-II,higher,10,10,-2.424225777417064,-1.9979472474747695,-0.12,0.7757224277572243
+best_hv,RL-AOS-GA vs Static NSGA-II,higher,10,10,-32311825482.078674,-8046128565.531982,-0.14,0.5037496250374962
+igd,RL-AOS-GA vs Static NSGA-II,lower,10,10,0.01939209913704218,0.02746423759961167,0.2,0.6739326067393261

@@ -1,0 +1,7 @@
+{
+  "elapsed_s": 47.98268941599963,
+  "generations": 50,
+  "mode": "rl",
+  "pop_size": 30,
+  "seed": 4
+}

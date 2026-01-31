@@ -33,7 +33,7 @@ def main():
     placement = JSSPPlacement(module_node_map)
     pop_policy = SimplePopulation(node_id=0, name="SimplePop")
 
-    sim.deploy_app(app, placement, selection=First_ShortestPath())
+    sim.deploy_app(app, placement, First_ShortestPath())
     sim.population_policy[pop_policy.name] = {"population_policy": pop_policy, "apps": [app.name]}
 
     sim.run(until=1000)

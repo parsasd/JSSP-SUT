@@ -1,0 +1,7 @@
+{
+  "elapsed_s": 47.86033266600134,
+  "generations": 50,
+  "mode": "nsga",
+  "pop_size": 30,
+  "seed": 2
+}

@@ -48,25 +48,29 @@ class JSSPWorkload:
                 app.add_service_source(source_name, dist, msg_start)
             else:
                 prev_module = f"Op_{job_id}_{op_idx-1}"
-                msg_in_name = f"Msg_J{job_id}_Op{op_idx-1}_to_Op{op_idx}"
+                prev_idx = op_idx - 1
+                if prev_idx == 0:
+                    msg_in_name = f"Msg_J{job_id}_Start"
+                else:
+                    msg_in_name = f"Msg_J{job_id}_Op{prev_idx-1}_to_Op{prev_idx}"
                 msg_in = app.messages[msg_in_name]
 
-                msg_current_name = msg_in_name
-                msg_current = Message(
-                    msg_current_name,
+                msg_out_name = f"Msg_J{job_id}_Op{op_idx-1}_to_Op{op_idx}"
+                msg_out = Message(
+                    msg_out_name,
                     prev_module,
                     current_module,
                     instructions=duration,
                     bytes=100,
                 )
-                msg_current.last_idDes = []
-                app.messages[msg_current_name] = msg_current
+                msg_out.last_idDes = []
+                app.messages[msg_out_name] = msg_out
 
                 # Register transition on the previous module
                 app.add_service_module(
                     prev_module,
                     message_in=msg_in,
-                    message_out=msg_current,
+                    message_out=msg_out,
                     distribution=lambda **_: True,
                     module_dest=[current_module],
                     p=[1.0],

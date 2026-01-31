@@ -3,6 +3,7 @@ import math
 import os
 import random
 import csv
+import tempfile
 from typing import Dict, List, Tuple, Any
 
 import networkx as nx
@@ -18,7 +19,12 @@ from yafs.selection import First_ShortestPath
 from job_factory import JSSPWorkload
 from placement import JSSPPlacement
 from simple_population import SimplePopulation
-from workload import parse_taillard, get_google_cluster_resources, ensure_datasets
+from workload import (
+    parse_taillard_with_meta,
+    get_google_cluster_resources,
+    ensure_datasets,
+    ensure_taillard_instance,
+)
 from yafs_patch import apply_yafs_patches
 
 
@@ -26,9 +32,10 @@ from yafs_patch import apply_yafs_patches
 # DATASET LOADING
 # ==========================================
 TA_FILE = ensure_datasets()
-GLOBAL_RAW_JOBS = parse_taillard(TA_FILE)
+GLOBAL_RAW_JOBS, NUM_MACHINES_REQ = parse_taillard_with_meta(TA_FILE)
 NUM_JOBS = len(GLOBAL_RAW_JOBS)
-NUM_MACHINES_REQ = 15
+if NUM_MACHINES_REQ <= 0:
+    NUM_MACHINES_REQ = 15
 GLOBAL_NODE_PROFILES = get_google_cluster_resources(NUM_MACHINES_REQ)
 
 
@@ -70,6 +77,20 @@ def build_operation_specs(raw_jobs: Dict[int, List[Dict[str, Any]]], node_profil
 
 OP_SPECS = build_operation_specs(GLOBAL_RAW_JOBS, GLOBAL_NODE_PROFILES)
 NUM_OPS = len(OP_SPECS)
+
+
+def init_instance(instance_spec: str | None) -> None:
+    global TA_FILE, GLOBAL_RAW_JOBS, NUM_JOBS, NUM_MACHINES_REQ, GLOBAL_NODE_PROFILES, OP_SPECS, NUM_OPS
+    if not instance_spec:
+        instance_spec = "ta01"
+    TA_FILE = ensure_taillard_instance(instance_spec)
+    GLOBAL_RAW_JOBS, NUM_MACHINES_REQ = parse_taillard_with_meta(TA_FILE)
+    NUM_JOBS = len(GLOBAL_RAW_JOBS)
+    if NUM_MACHINES_REQ <= 0:
+        NUM_MACHINES_REQ = 15
+    GLOBAL_NODE_PROFILES = get_google_cluster_resources(NUM_MACHINES_REQ)
+    OP_SPECS = build_operation_specs(GLOBAL_RAW_JOBS, GLOBAL_NODE_PROFILES)
+    NUM_OPS = len(OP_SPECS)
 
 
 # ==========================================
@@ -191,6 +212,35 @@ def hypervolume_minimize(population, reference_point):
     return hv
 
 
+def reference_point_from_population(population, scale: float = 1.2):
+    """Build a fixed (worse) reference point for minimization HV proxy."""
+    ref_m = max(ind.fitness.values[0] for ind in population) * scale
+    ref_e = max(ind.fitness.values[1] for ind in population) * scale
+    ref_r = max(-ind.fitness.values[2] for ind in population) * scale
+    return (ref_m, ref_e, ref_r)
+
+
+def fixed_reference_point(toolbox, sample_size: int, scale: float = 1.2, seed: int = 1337):
+    """
+    Build a deterministic reference point by sampling a fixed random population.
+    This keeps hypervolume comparable across runs for the same instance.
+    """
+    if sample_size <= 0:
+        sample_size = 1
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    random.seed(seed)
+    np.random.seed(seed)
+    pop = toolbox.population(n=sample_size)
+    fitnesses = list(map(toolbox.evaluate, pop))
+    for ind, fit in zip(pop, fitnesses):
+        ind.fitness.values = fit
+    ref = reference_point_from_population(pop, scale=scale)
+    random.setstate(py_state)
+    np.random.set_state(np_state)
+    return ref
+
+
 def evaluate_schedule(individual: List[int]):
     if not GLOBAL_RAW_JOBS or not OP_SPECS:
         return (999999, 999999, -999999)
@@ -216,82 +266,89 @@ def evaluate_schedule(individual: List[int]):
     workload_factory = JSSPWorkload(GLOBAL_RAW_JOBS, OP_SPECS)
     app = workload_factory.create_application(release_times, module_node_map)
 
-    log_file = f"logs/log_eval_{os.getpid()}_{random.randint(0, 999999)}.csv"
+    # Evaluation runs generate YAFS CSV logs. Use a temp directory and
+    # auto-clean it to avoid polluting `logs/` with thousands of *_link.csv files.
+    with tempfile.TemporaryDirectory(prefix="edge_jssp_eval_") as tmpdir:
+        base_path = os.path.join(
+            tmpdir, f"log_eval_{os.getpid()}_{random.randint(0, 999999)}"
+        )
+        csv_path = f"{base_path}.csv"
 
-    topo = create_topology(GLOBAL_NODE_PROFILES)
-    s = yafs.core.Sim(topo, default_results_path=log_file.replace(".csv", ""))
-    pop_policy = SimplePopulation(node_id=0, name="SimplePop")
-    s.deploy_app(app, JSSPPlacement(module_node_map), First_ShortestPath())
-    s.population_policy[pop_policy.name] = {"population_policy": pop_policy, "apps": [app.name]}
+        topo = create_topology(GLOBAL_NODE_PROFILES)
+        s = yafs.core.Sim(topo, default_results_path=base_path)
+        pop_policy = SimplePopulation(node_id=0, name="SimplePop")
+        s.deploy_app(app, JSSPPlacement(module_node_map), First_ShortestPath())
+        s.population_policy[pop_policy.name] = {
+            "population_policy": pop_policy,
+            "apps": [app.name],
+        }
 
-    # Sample stochastic failure times for reliability modeling
-    failure_times = {}
-    rng = random.Random(1234)
-    for node_id, attrs in topo.G.nodes(data=True):
-        if node_id == 0:
-            continue
-        lam = attrs.get("failure_rate", 0.001)
-        failure_times[node_id] = rng.expovariate(lam) if lam > 0 else math.inf
+        # Sample stochastic failure times for reliability modeling
+        failure_times = {}
+        rng = random.Random(1234)
+        for node_id, attrs in topo.G.nodes(data=True):
+            if node_id == 0:
+                continue
+            lam = attrs.get("failure_rate", 0.001)
+            failure_times[node_id] = rng.expovariate(lam) if lam > 0 else math.inf
 
-    s.run(until=200000)
+        s.run(until=200000)
 
-    try:
-        df = pd.read_csv(log_file)
-        if os.path.exists(log_file):
-            os.remove(log_file)
-        if df.empty:
+        try:
+            df = pd.read_csv(csv_path)
+            if df.empty:
+                return (999999, 999999, -999999)
+
+            makespan = df["time_out"].max()
+
+            processing_events = df[df["time_out"] > df["time_in"]]
+
+            # Static energy
+            cluster_static_power = sum(
+                d.get("static_power", 0) for _, d in topo.G.nodes(data=True)
+            )
+            static_energy = cluster_static_power * makespan
+
+            # Dynamic + communication energy
+            dynamic_energy = 0.0
+            comm_energy = 0.0
+            has_src = "TOPO.src" in processing_events.columns
+            for _, row in processing_events.iterrows():
+                duration = row["time_out"] - row["time_in"]
+                node_id = int(row["TOPO.dst"])
+                node_attrs = topo.G.nodes[node_id]
+                p_alpha = node_attrs.get("power_alpha", 0.0)
+                ipt = node_attrs.get("IPT", 1.0)
+                p_dynamic = p_alpha * (ipt**3)
+                dynamic_energy += p_dynamic * duration
+
+                # simple communication proxy: per-hop energy if src!=dst
+                if has_src and row["TOPO.src"] != row["TOPO.dst"]:
+                    comm_energy += 0.01 * duration
+
+            total_energy = static_energy + dynamic_energy + comm_energy
+
+            # Reliability with failure penalties
+            reliability_log_sum = 0.0
+            failure_penalty = 0.0
+            for _, row in processing_events.iterrows():
+                duration = row["time_out"] - row["time_in"]
+                node_id = int(row["TOPO.dst"])
+                node_attrs = topo.G.nodes[node_id]
+                lam = node_attrs.get("failure_rate", 0.001)
+                reliability_log_sum += -lam * duration
+                failure_time = failure_times.get(node_id, math.inf)
+                if row["time_out"] > failure_time:
+                    # penalize makespan and reliability when failure window is crossed
+                    failure_penalty = max(failure_penalty, 500.0)
+                    reliability_log_sum += -5.0
+
+            makespan += failure_penalty
+
+            return (float(makespan), float(total_energy), float(reliability_log_sum))
+
+        except Exception:
             return (999999, 999999, -999999)
-
-        makespan = df["time_out"].max()
-
-        processing_events = df[df["time_out"] > df["time_in"]]
-
-        # Static energy
-        cluster_static_power = sum(d.get("static_power", 0) for _, d in topo.G.nodes(data=True))
-        static_energy = cluster_static_power * makespan
-
-        # Dynamic + communication energy
-        dynamic_energy = 0.0
-        comm_energy = 0.0
-        has_src = "TOPO.src" in processing_events.columns
-        for _, row in processing_events.iterrows():
-            duration = row["time_out"] - row["time_in"]
-            node_id = int(row["TOPO.dst"])
-            node_attrs = topo.G.nodes[node_id]
-            p_alpha = node_attrs.get("power_alpha", 0.0)
-            ipt = node_attrs.get("IPT", 1.0)
-            p_dynamic = p_alpha * (ipt ** 3)
-            dynamic_energy += p_dynamic * duration
-
-            # simple communication proxy: per-hop energy if src!=dst
-            if has_src and row["TOPO.src"] != row["TOPO.dst"]:
-                comm_energy += 0.01 * duration
-
-        total_energy = static_energy + dynamic_energy + comm_energy
-
-        # Reliability with failure penalties
-        reliability_log_sum = 0.0
-        failure_penalty = 0.0
-        for _, row in processing_events.iterrows():
-            duration = row["time_out"] - row["time_in"]
-            node_id = int(row["TOPO.dst"])
-            node_attrs = topo.G.nodes[node_id]
-            lam = node_attrs.get("failure_rate", 0.001)
-            reliability_log_sum += (-lam * duration)
-            failure_time = failure_times.get(node_id, math.inf)
-            if row["time_out"] > failure_time:
-                # penalize makespan and reliability when failure window is crossed
-                failure_penalty = max(failure_penalty, 500.0)
-                reliability_log_sum += -5.0
-
-        makespan += failure_penalty
-
-        return (float(makespan), float(total_energy), float(reliability_log_sum))
-
-    except Exception:
-        if os.path.exists(log_file):
-            os.remove(log_file)
-        return (999999, 999999, -999999)
 
 
 # ==========================================
@@ -391,7 +448,7 @@ RL_ACTIONS = [op_balanced, op_explore, op_exploit]
 # ==========================================
 def run_rl_optimizer(args):
     print("--- STARTING RL-AOS-GA OPTIMIZER ---")
-    os.makedirs("logs", exist_ok=True)
+    init_instance(getattr(args, "instance", None))
     toolbox = build_toolbox()
 
     log_filename = os.path.join(args.logdir, "training_log.csv")
@@ -415,6 +472,7 @@ def run_rl_optimizer(args):
         )
 
     pop = toolbox.population(n=args.pop_size)
+    policy = getattr(args, "policy", "learned").lower()
     agent = QLearningAgent(actions=RL_ACTIONS)
 
     fitnesses = list(map(toolbox.evaluate, pop))
@@ -425,18 +483,30 @@ def run_rl_optimizer(args):
     best_makespan_history = [min(ind.fitness.values[0] for ind in pop)]
     hv_history = []
 
-    # Reference point for HV: use max of population scaled up
-    ref_m = max(ind.fitness.values[0] for ind in pop) * 1.2
-    ref_e = max(ind.fitness.values[1] for ind in pop) * 1.2
-    ref_r = max(-ind.fitness.values[2] for ind in pop) * 1.2
-    hv = hypervolume_minimize(pop, (ref_m, ref_e, ref_r))
+    # Fixed reference point for HV proxy so hypervolume is comparable across runs
+    reference_point = fixed_reference_point(
+        toolbox,
+        sample_size=getattr(args, "hv_ref_samples", max(1, args.pop_size)),
+        scale=getattr(args, "hv_ref_scale", 1.2),
+        seed=getattr(args, "hv_ref_seed", 1337),
+    )
+    hv = hypervolume_minimize(pop, reference_point)
     hv_history.append(hv)
 
     for g in range(args.generations):
-        state = agent.get_state(pop, best_makespan_history, hv_history)
-        action_idx = agent.choose_action(state)
-        agent.last_state = state
-        agent.last_action = action_idx
+        state = agent.get_state(pop, best_makespan_history, [] if policy == "no_hv" else hv_history)
+        if policy == "random":
+            action_idx = random.choice(range(len(RL_ACTIONS)))
+        elif policy == "fixed_balanced":
+            action_idx = 0
+        elif policy == "fixed_explore":
+            action_idx = 1
+        elif policy == "fixed_exploit":
+            action_idx = 2
+        else:
+            action_idx = agent.choose_action(state)
+            agent.last_state = state
+            agent.last_action = action_idx
         act_name = ["Balanced", "Explore", "Exploit"][action_idx]
 
         offspring = toolbox.select_parents(pop, len(pop))
@@ -458,23 +528,23 @@ def run_rl_optimizer(args):
         current_best_makespan = min(ind.fitness.values[0] for ind in pop)
         improvement = best_makespan_history[-1] - current_best_makespan
 
-        ref_m = max(ind.fitness.values[0] for ind in pop) * 1.2
-        ref_e = max(ind.fitness.values[1] for ind in pop) * 1.2
-        ref_r = max(-ind.fitness.values[2] for ind in pop) * 1.2
-        hv = hypervolume_minimize(pop, (ref_m, ref_e, ref_r))
+        hv = hypervolume_minimize(pop, reference_point)
         hv_history.append(hv)
+        hv_delta = hv_history[-1] - hv_history[-2]
+        hv_term = 0.0 if policy == "no_hv" else hv_delta / (abs(hv_history[-2]) + 1e-9)
 
         if improvement > 0:
-            reward = 5 + improvement + (hv_history[-1] - hv_history[-2])
+            reward = 5 + improvement + hv_term
         elif improvement == 0:
-            reward = -1 + (hv_history[-1] - hv_history[-2])
+            reward = -1 + hv_term
         else:
             reward = -5
 
-        agent.learn(state, reward)
+        if policy not in {"random", "fixed_balanced", "fixed_explore", "fixed_exploit"}:
+            agent.learn(state, reward)
         best_makespan_history.append(current_best_makespan)
 
-        best_gen_ind = pop[0]
+        best_gen_ind = min(pop, key=lambda ind: ind.fitness.values[0])
         with open(log_filename, "a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(
@@ -507,16 +577,28 @@ def run_rl_optimizer(args):
 
 def run_nsga_baseline(args):
     print("--- STARTING STATIC NSGA-II BASELINE ---")
+    init_instance(getattr(args, "instance", None))
     os.makedirs(args.logdir, exist_ok=True)
     toolbox = build_toolbox()
     log_filename = os.path.join(args.logdir, "baseline_log.csv")
     pareto_filename = os.path.join(args.logdir, "baseline_pareto.csv")
+    training_filename = os.path.join(args.logdir, "baseline_training_log.csv")
 
     pop = toolbox.population(n=args.pop_size)
     fitnesses = list(map(toolbox.evaluate, pop))
     for ind, fit in zip(pop, fitnesses):
         ind.fitness.values = fit
     pop = toolbox.select_survivors(pop, len(pop))
+
+    reference_point = fixed_reference_point(
+        toolbox,
+        sample_size=getattr(args, "hv_ref_samples", max(1, args.pop_size)),
+        scale=getattr(args, "hv_ref_scale", 1.2),
+        seed=getattr(args, "hv_ref_seed", 1337),
+    )
+    with open(training_filename, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Generation", "Best_Makespan", "Best_Energy", "Best_Reliability", "Hypervolume"])
 
     for g in range(args.generations):
         offspring = toolbox.select_parents(pop, len(pop))
@@ -532,6 +614,20 @@ def run_nsga_baseline(args):
 
         combined_pop = pop + offspring
         pop[:] = toolbox.select_survivors(combined_pop, len(pop))
+
+        best_gen_ind = min(pop, key=lambda ind: ind.fitness.values[0])
+        hv = hypervolume_minimize(pop, reference_point)
+        with open(training_filename, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    g,
+                    best_gen_ind.fitness.values[0],
+                    best_gen_ind.fitness.values[1],
+                    best_gen_ind.fitness.values[2],
+                    hv,
+                ]
+            )
 
     with open(log_filename, "w", newline="") as f:
         writer = csv.writer(f)
@@ -554,6 +650,16 @@ def parse_args():
     parser.add_argument("--pop-size", type=int, default=20, help="Population size")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--logdir", type=str, default="logs", help="Directory for logs")
+    parser.add_argument("--instance", type=str, default="ta01", help="Taillard instance name or path.")
+    parser.add_argument(
+        "--policy",
+        choices=["learned", "random", "no_hv", "fixed_balanced", "fixed_explore", "fixed_exploit"],
+        default="learned",
+        help="RL operator-selection policy (only for rl mode).",
+    )
+    parser.add_argument("--hv-ref-samples", type=int, default=50, help="Samples for fixed HV reference point.")
+    parser.add_argument("--hv-ref-scale", type=float, default=1.2, help="Scale for HV reference point.")
+    parser.add_argument("--hv-ref-seed", type=int, default=1337, help="Seed for HV reference sampling.")
     return parser.parse_args()
 
 

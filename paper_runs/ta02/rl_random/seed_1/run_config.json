@@ -1,0 +1,13 @@
+{
+  "elapsed_s": 53.13071537500218,
+  "generations": 50,
+  "hv_ref_samples": 50,
+  "hv_ref_scale": 1.2,
+  "hv_ref_seed": 1337,
+  "instance": "ta02",
+  "instance_path": "data/taillard_instances/ta02.txt",
+  "mode": "rl_random",
+  "policy": "random",
+  "pop_size": 30,
+  "seed": 1
+}
